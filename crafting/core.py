@@ -49,7 +49,7 @@ def parse_recipe(raw):
         raise CraftingError("recipe %s does not yield %s" % (rid, name))
     for table in tables:
         for item, qty in table.items():
-            if not isinstance(qty, int) or qty < 0:
+            if not isinstance(qty, int) or qty <= 0:
                 raise CraftingError("recipe %s has a bad amount of %s" % (rid, item))
     workbench = raw.get("workbench", 0)
     priority = raw.get("priority", 0)
@@ -73,13 +73,13 @@ def build_index(recipes):
     for recipe in recipes:
         index[recipe.name].append(recipe)
     for entries in index.values():
-        entries.sort(key=lambda recipe: recipe.priority)
+        entries.sort(key=lambda recipe: recipe.priority, reverse=True)
     return dict(index)
 
 
 def pick_recipe(index, product, workbench=0):
     """Return the recipe to run for product at the given workbench level."""
-    usable = [entry for entry in index.get(product, ()) if entry.workbench >= workbench]
+    usable = [entry for entry in index.get(product, ()) if entry.workbench <= workbench]
     if not usable:
         raise CraftingError("no recipe for %s at workbench %d" % (product, workbench))
     return usable[0]
@@ -87,13 +87,34 @@ def pick_recipe(index, product, workbench=0):
 
 def find_cycles(index):
     """Return the products that take part in a dependency cycle, sorted by name."""
+    graph = {}
+    for product, recipes in index.items():
+        deps = set()
+        for recipe in recipes:
+            for item in recipe.inputs:
+                if item in index:
+                    deps.add(item)
+        graph[product] = deps
     found = []
     for product in sorted(index):
-        for recipe in index[product]:
-            if product in recipe.inputs:
-                found.append(product)
-                break
+        if _reaches(graph, product, product):
+            found.append(product)
     return found
+
+
+def _reaches(graph, start, target):
+    """Return True when target is reachable from start along graph edges."""
+    seen = set()
+    stack = [start]
+    while stack:
+        node = stack.pop()
+        for nxt in graph.get(node, ()):
+            if nxt == target:
+                return True
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return False
 
 
 def craft(inventory, index, product, count, workbench=0):
@@ -103,33 +124,36 @@ def craft(inventory, index, product, count, workbench=0):
     """
     if count <= 0:
         raise CraftingError("count must be positive")
+    result = dict(inventory)
+    _craft_into(result, index, product, count, workbench, 0)
+    return result
+
+
+def _craft_into(inventory, index, product, count, workbench, depth):
+    """Craft count units of product into inventory, assembling intermediates."""
+    if depth > MAX_DEPTH:
+        raise CraftingError("recipe graph too deep at %s" % product)
     recipe = pick_recipe(index, product, workbench)
     batches = _batch_count(recipe, product, count)
-    result = dict(inventory)
     for item, need in recipe.inputs.items():
-        _take(result, item, need * batches)
-    if recipe.tool and recipe.tool in result:
-        _take(result, recipe.tool, recipe.tool_uses * batches)
+        total = need * batches
+        have = inventory.get(item, 0)
+        if have < total:
+            _craft_into(inventory, index, item, total - have, workbench, depth + 1)
+        _take(inventory, item, total)
+    if recipe.tool:
+        _take(inventory, recipe.tool, recipe.tool_uses * batches)
     for item, qty in _gains(recipe, batches).items():
-        result[item] = result.get(item, 0) + qty
-    return result
+        inventory[item] = inventory.get(item, 0) + qty
 
 
 def can_craft(inventory, index, product, count, workbench=0):
     """Return True when count units of product can be produced from the inventory."""
     if count <= 0:
         raise CraftingError("count must be positive")
-    recipe = _select(index, product, workbench)
-    if recipe is None:
-        return False
-    batches = _batch_count(recipe, product, count)
-    for item, need in recipe.inputs.items():
-        short = need * batches - inventory.get(item, 0)
-        if short <= 0:
-            continue
-        if not _coverable(inventory, index, item, short, workbench):
-            return False
-    if recipe.tool and inventory.get(recipe.tool, 0) < recipe.tool_uses * batches:
+    try:
+        craft(inventory, index, product, count, workbench)
+    except CraftingError:
         return False
     return True
 
@@ -137,11 +161,19 @@ def can_craft(inventory, index, product, count, workbench=0):
 def total_stock(inventory, index, product, workbench=0):
     """Return how many units of product the inventory can yield in total."""
     on_hand = inventory.get(product, 0)
-    recipe = _select(index, product, workbench)
-    if recipe is None:
+    if _select(index, product, workbench) is None:
         return on_hand
-    runs = _runs_on_hand(inventory, recipe, product)
-    return on_hand + runs * recipe.outputs.get(product, 0)
+    low, high = 0, 1
+    while high <= (1 << 60) and can_craft(inventory, index, product, high, workbench):
+        low = high
+        high *= 2
+    while high - low > 1:
+        mid = (low + high) // 2
+        if can_craft(inventory, index, product, mid, workbench):
+            low = mid
+        else:
+            high = mid
+    return on_hand + low
 
 
 def _select(index, product, workbench):
@@ -157,13 +189,15 @@ def _batch_count(recipe, product, count):
     per_run = recipe.outputs.get(product, 0)
     if per_run <= 0:
         raise CraftingError("recipe %s does not yield %s" % (recipe.rid, product))
-    return count // per_run
+    return -(-count // per_run)
 
 
 def _gains(recipe, batches):
     """Return the items a run of batches turns out."""
     gains = {}
     for item, qty in recipe.outputs.items():
+        gains[item] = gains.get(item, 0) + qty * batches
+    for item, qty in recipe.byproducts.items():
         gains[item] = gains.get(item, 0) + qty * batches
     return gains
 
@@ -174,30 +208,3 @@ def _take(inventory, item, qty):
     if have < qty:
         raise CraftingError("not enough %s: need %d, have %d" % (item, qty, have))
     inventory[item] = have - qty
-
-
-def _runs_on_hand(inventory, recipe, product):
-    """Return how many runs of recipe the items on hand allow."""
-    limits = []
-    for item, need in recipe.inputs.items():
-        limits.append(inventory.get(item, 0) // need)
-    if not limits:
-        return 0
-    return min(limits)
-
-
-def _coverable(inventory, index, item, shortfall, workbench=0, depth=0):
-    """Return True when shortfall more units of item can be assembled right now."""
-    if depth > MAX_DEPTH:
-        raise CraftingError("recipe graph too deep at %s" % item)
-    recipe = _select(index, item, workbench)
-    if recipe is None:
-        return False
-    batches = _batch_count(recipe, item, shortfall)
-    for part, need in recipe.inputs.items():
-        short = need * batches - inventory.get(part, 0)
-        if short <= 0:
-            continue
-        if not _coverable(inventory, index, part, short, workbench, depth + 1):
-            return False
-    return True
